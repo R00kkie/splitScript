@@ -1,5 +1,6 @@
 # coding=utf-8
 import re
+import datetime
 import argparse, os, logging, time
 logger = logging.getLogger(__name__)
 class Episode():
@@ -28,9 +29,10 @@ class Episode():
         for s in self.episodeList:
             # clean the script
             s = s.replace('’', '\'')
-            s = s.replace('\n\n', '\n')
-            # 剧本字幕不同人名问题
+            s = s.replace('\n\n', '\n').replace('’', '\'')
+            # 剧本字幕统一表达
             s = s.replace('Lesley', 'Leslie')
+            s = s.replace('mum', 'mom')
             splitSession = s.split('Scene:')
             while "" in splitSession:
                 splitSession.remove("")
@@ -196,68 +198,131 @@ def parse_config():
 
     return parser.parse_args()
 
+# 全字匹配
+def isIncludeKeyWord(detailinfo, keyword):
+  if -1 != detailinfo.find(keyword):
+    pattern_str = '(^' + keyword + '$)|(^' + keyword + '(\W+).*)|(.*(\W+)' + keyword + '$)|(.*(\W+)' + keyword + '(\W+).*)'
+    m = re.match(r'' + pattern_str + '', detailinfo)
+    if m:
+      return 1
+  return 0
+
+# 字幕时间相减 srt2 > srt1
+def time_differ(date1, date2):
+    date1 = date1.strip()
+    date2 = date2.strip()
+    date1 = re.sub(r',[0-9 ]+', '', date1)
+    date2 = re.sub(r',[0-9 ]+', '', date2)
+    '''
+    @传入是时间格式如'12:55:05'
+    '''
+    date1 = datetime.datetime.strptime(date1, "%H:%M:%S")
+    date2 = datetime.datetime.strptime(date2, "%H:%M:%S")
+    if date1 < date2:
+        return (date2 - date1).total_seconds()
+    else:
+        return (date1 - date2).total_seconds()
+
+
 def LocateTime(episode, subtitle):
+    # 已完成定位的段落将不再参与之后的定位
+    flag = 0
     for s in episode.sessionList:
         episodeNum = s.episodeNum
         sessionNum = s.sessionNum
         alternate = []
         for sub in subtitle.timeBlockList:
-            if sub.episodeNum == episodeNum:
+            if sub.episodeNum == episodeNum and sub.timeBlockNum >= flag:
                 alternate.append(sub)
             elif sub.episodeNum > episodeNum:
                 break
             else:
                 continue
-
         # locate begin
         i = 0
         while ':' not in s.sessionContent[i]:
             i = i + 1
-        beginCharactor, beginContent = s.sessionContent[i].split(':')
+        beginCharactor, beginContent1 = s.sessionContent[i].split(':')
 
+        m = i + 1
+        if m >= len(s.sessionContent) - 1:
+            beginContent = beginContent1
+        else:
+            while ':' not in s.sessionContent[m]:
+                m = m + 1
+            _, beginContent2 = s.sessionContent[m].split(':', 1)
+            beginContent = beginContent1 + beginContent2
+
+
+        # 定位结尾
         j = len(s.sessionContent) - 1
         while True:
             if ':' in s.sessionContent[j] or j == 0:
-                endCharactor, endContent = s.sessionContent[j].split(':')
+                endCharactor, endContent1 = s.sessionContent[j].split(':')
                 break
             else:
                 j = j - 1
 
-        beginContent = re.sub('\(.*?\)', '', beginContent)
-        beginContent = re.split(r'[.,?!]', beginContent)
-        beginContent = max(beginContent, key=len, default='').lower().strip()
+        n = j - 1
+        while True:
+            if ':' in s.sessionContent[n] or n == 0:
+                _, endContent2 = s.sessionContent[n].split(':')
+                break
+            else:
+                n = n - 1
+        endContent = endContent2 + endContent1
 
-        endContent = re.sub('\(.*?\)', '', endContent)
-        endContent = re.split(r'[.,?!]', endContent)
-        endContent = max(endContent, key=len, default='').lower().strip()
+        #beginContent = re.sub('\(.*?\)', '', beginContent)
+        beginContent = beginContent.lower()
+        #beginContent = max(beginContent, key=len, default='').lower().strip()
+
+        #endContent = re.sub('\(.*?\)', '', endContent)
+        endContent = endContent.lower()
+        #endContent = max(endContent, key=len, default='').lower().strip()
 
         beginTime = None
         endTime = None
         timeBlockNum1 = timeBlockNum2 = None
         for i in range(len(alternate)):
-            # decide which is longer: script or subtitle?
-            if len(alternate[i].content_en) <= len(beginContent):
-                if alternate[i].content_en in beginContent:
+            if i == len(alternate) - 1:
+                _srt = re.split(r'[-.,?!"]', alternate[i].content_en)
+                srt = max(_srt, key=len, default='').lower().strip()
+                if isIncludeKeyWord(beginContent, srt):
                     beginTime = alternate[i].beginTime
                     timeBlockNum1 = alternate[i].timeBlockNum
+                    # 完成开头定位的片段将不参与之后的结尾定位
+                    alternate = alternate[i:]
                     break
             else:
-                if beginContent in alternate[i].content_en:
+                _srt = re.split(r'[-.,?!"]', alternate[i].content_en)
+                _next = re.split(r'[-.,?!"]', alternate[i+1].content_en)
+                srt_next = max(_next, key=len, default='').lower().strip()
+                srt = max(_srt, key=len, default='').lower().strip()
+                if isIncludeKeyWord(beginContent, srt) and isIncludeKeyWord(beginContent, srt_next):
                     beginTime = alternate[i].beginTime
                     timeBlockNum1 = alternate[i].timeBlockNum
+                    # 完成开头定位的片段将不参与之后的结尾定位
+                    alternate = alternate[i:]
                     break
 
-        for i in range(len(alternate)):
-            if len(alternate[i].content_en) <= len(endContent):
-                if alternate[i].content_en in endContent:
-                    endTime = alternate[i].endTime
-                    timeBlockNum2 = alternate[i].timeBlockNum
-                    break
+        j = len(alternate) - 1
+        while True:
+            if j == 0:
+                break
             else:
-                if endContent in alternate[i].content_en:
-                    endTime = alternate[i].endTime
-                    timeBlockNum2 = alternate[i].timeBlockNum
-                    break
+                _srt = re.split(r'[-.,?!"]', alternate[j].content_en)
+                _next = re.split(r'[-.,?!"]', alternate[j - 1].content_en)
+                srt_next = max(_next, key=len, default='').lower().strip()
+                srt = max(_srt, key=len, default='').lower().strip()
+                if isIncludeKeyWord(endContent, srt) and isIncludeKeyWord(endContent, srt_next):
+                    endTime = alternate[j].endTime
+                    timeBlockNum2 = alternate[j].timeBlockNum
+                    flag = alternate[j].timeBlockNum
+                    j = j - 1
+                else:
+                    j = j - 1
+
+
         if timeBlockNum2 and timeBlockNum1 and timeBlockNum2 > timeBlockNum1:
             s.sessionBeginTime = beginTime
             s.beginTimeBlockNum = timeBlockNum1
@@ -278,8 +343,10 @@ def LocateTime(episode, subtitle):
     for i in range(len(episode.sessionList)-1):
         if episode.sessionList[i].beginTimeBlockNum is None and episode.sessionList[i-1].endTimeBlockNum:
             episode.sessionList[i].sessionBeginTime = subtitle.timeBlockList[episode.sessionList[i-1].endTimeBlockNum+1].beginTime
+            episode.sessionList[i].beginTimeBlockNum = subtitle.timeBlockList[episode.sessionList[i-1].endTimeBlockNum+1].timeBlockNum
         if episode.sessionList[i].endTimeBlockNum is None and episode.sessionList[i+1].beginTimeBlockNum:
             episode.sessionList[i].sessionEndTime = subtitle.timeBlockList[episode.sessionList[i+1].beginTimeBlockNum-1].beginTime
+            episode.sessionList[i].endTimeBlockNum = subtitle.timeBlockList[episode.sessionList[i+1].beginTimeBlockNum-1].timeBlockNum
 
 def setTime(episode,subtitle):
     dic = {}
@@ -287,22 +354,28 @@ def setTime(episode,subtitle):
         temp = {s.beginTime: s.timeBlockNum}
         dic.update(temp)
 
-    episode.sessionList[7].sessionBeginTime = '00:17:38,960 '
-    episode.sessionList[7].beginTimeBlockNum = dic[episode.sessionList[7].sessionBeginTime]
-    episode.sessionList[46].sessionBeginTime = '00:18:11,170 '
-    episode.sessionList[46].beginTimeBlockNum = dic[episode.sessionList[46].sessionBeginTime]
-    episode.sessionList[54].sessionBeginTime = '00:15:39,540 '
-    episode.sessionList[54].beginTimeBlockNum = dic[episode.sessionList[54].sessionBeginTime]
-    episode.sessionList[62].sessionBeginTime = '00:20:15,120 '
-    episode.sessionList[62].beginTimeBlockNum = dic[episode.sessionList[62].sessionBeginTime]
-    episode.sessionList[71].sessionBeginTime = '00:04:37,480 '
-    episode.sessionList[71].beginTimeBlockNum = dic[episode.sessionList[71].sessionBeginTime]
-    episode.sessionList[77].sessionBeginTime = '00:03:06,730 '
-    episode.sessionList[77].beginTimeBlockNum = dic[episode.sessionList[77].sessionBeginTime]
-    episode.sessionList[114].sessionBeginTime = '00:18:59,960 '
-    episode.sessionList[114].beginTimeBlockNum = dic[episode.sessionList[114].sessionBeginTime]
-    episode.sessionList[160].sessionBeginTime = '00:19:19,920 '
-    episode.sessionList[160].beginTimeBlockNum = dic[episode.sessionList[160].sessionBeginTime]
+    episode.sessionList[-1].sessionEndTime = subtitle.timeBlockList[-1].beginTime
+    episode.sessionList[-1].endTimeBlockNum = len(subtitle.timeBlockList)
+    episode.sessionList[158].sessionBeginTime = '00:19:19,920 '
+    episode.sessionList[158].beginTimeBlockNum = dic[episode.sessionList[158].sessionBeginTime]
+
+# 打印定位的置信度：定位前后三句话覆盖的单词比例
+def printConfidence(episode, subtitle):
+    reg = "[-.,?!\"]"
+    for e in episode.sessionList:
+        # 开头置信度计算
+        content = e.sessionContent
+        srt = subtitle.timeBlockList[e.beginTimeBlockNum].content_en
+        srt1 = subtitle.timeBlockList[e.beginTimeBlockNum + 1].content_en
+        srt2 = subtitle.timeBlockList[e.beginTimeBlockNum + 2].content_en
+        srt3 = subtitle.timeBlockList[e.beginTimeBlockNum + 3].content_en
+        #content = re.sub(reg, '', content)
+        srt = re.sub(reg, '', srt)
+        srt1 = re.sub(reg, '', srt1)
+        srt2 = re.sub(reg, '', srt2)
+        srt3 = re.sub(reg, '', srt3)
+
+
 
 def main(args):
 
@@ -335,9 +408,12 @@ def main(args):
             flag3 = flag3 + 1
     episode.showInfo()
     print(flag1, flag2, flag3)
-    print(noBegin,noEnd)
-    """for begin in noBegin:
-        print(episode.sessionList[begin].sessionContent)"""
+    for i in noBegin:
+        print(episode.sessionList[i].episodeNum, episode.sessionList[i].sessionNum)
+    print('\n')
+    for i in noEnd:
+        print(episode.sessionList[i].episodeNum, episode.sessionList[i].sessionNum)
+    printConfidence(episode, subtitle)
 if __name__ == '__main__':
     args = parse_config()
     main(args)
